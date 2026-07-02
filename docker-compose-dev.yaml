@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  dechecker-backend:
+    build: .
+    container_name: dechecker_api
+    ports:
+      - "8000:8000"
+    environment:
+      - API_KEY=my_secure_secret_token_2026
+    volumes:
+      # Модели будут скачиваться в эту локальную папку на вашем ПК
+      - ./model_data:/app/models
+    restart: unless-stopped
