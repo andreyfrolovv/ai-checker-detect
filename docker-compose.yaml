@@ -4,8 +4,8 @@ services:
   dechecker-backend:
     build: model_data
     container_name: dechecker_api
-    ports:
-      - "8000:8000"
+#    ports:
+#      - "8000:8000"
     environment:
       - WATCHFILES_FORCE_POLLING=true
       - PYTHONDONTWRITEBYTECODE=1
