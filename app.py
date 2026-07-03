@@ -226,38 +226,36 @@ async def activate_model(folder_name: str):
 
 
 @app.post("/predict")
-async def predict(payload: PredictRequest):
-    """Маршрут для предсказания текста с вынесением булевого вердикта"""
+async def predict(data: TextRequest):  # или как называется ваша Pydantic-модель
     if model is None or tokenizer is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Модель не загружена"
-        )
+        raise HTTPException(status_code=503, detail="Модель не загружена")
 
-    try:
-        inputs = tokenizer(payload.text, return_tensors="pt", truncation=True, max_length=512)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+    # 1. Токенизация текста
+    inputs = tokenizer(data.text, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        with torch.no_grad():
-            outputs = model(**inputs)
+    with torch.no_grad():
+        outputs = model(**inputs)
 
-        logits = outputs.logits
-        probs = torch.softmax(logits, dim=-1)
-        probabilities_list = probs.tolist()
+    # 2. Получаем сырой логит
+    logits = outputs.logits  # Имеет форму [[значение]]
 
-        predicted_class_id = torch.argmax(probs, dim=-1).item()
+    # === ИСПРАВЛЕНИЕ БАГА: Используем torch.sigmoid вместо torch.softmax ===
+    probs = torch.sigmoid(logits)
 
-        # Булевый вердикт: True если ИИ (класс 1), False если человек (класс 0)
-        is_ai_generated = (predicted_class_id == 1)
+    # Получаем численные значения для ответа API
+    logits_list = logits.cpu().tolist()
+    probs_list = probs.cpu().tolist()
 
-        return {
-            "model": current_model_name,
-            "verdict": is_ai_generated,
-            "probabilities": probabilities_list,
-            "logits": logits.tolist()
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ошибка инференса: {str(e)}"
-        )
+    # Извлекаем саму вероятность (число от 0.0 до 1.0)
+    prob_value = probs_list[0][0]
+
+    # Определяем вердикт (например, если вероятность ИИ > 0.5)
+    verdict = prob_value > 0.5
+
+    return {
+        "model": current_model_name,
+        "verdict": verdict,
+        "probabilities": probs_list,
+        "logits": logits_list
+    }
