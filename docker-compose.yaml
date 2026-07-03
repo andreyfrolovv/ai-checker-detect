@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   dechecker-backend:
-    build: model_data
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: dechecker_api
 #    ports:
 #      - "8000:8000"
