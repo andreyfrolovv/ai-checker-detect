@@ -8,7 +8,7 @@ from huggingface_hub import model_info, snapshot_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm.auto import tqdm
 from transformers import DebertaV2ForSequenceClassification, AutoConfig, AutoTokenizer
-
+# робочее состояние
 app = FastAPI(title="Dynamic AI Text Detector API")
 
 # Конфигурация путей и безопасности
