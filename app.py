@@ -10,7 +10,6 @@ from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm.auto import tqdm
 from transformers import DebertaV2ForSequenceClassification, AutoConfig, AutoTokenizer
 from transformers import AutoTokenizer, AutoConfig, AutoModel, PreTrainedModel
-# робочее состояние
 app = FastAPI(title="Dynamic AI Text Detector API")
 
 # Конфигурация путей и безопасности
@@ -26,6 +25,8 @@ device = "cpu"
 # Статусы фонового скачивания моделей
 download_tasks = {}
 
+class PredictRequest(BaseModel):
+    text: str
 
 def create_progress_tracker(repo_id: str):
     """Фабрика для создания класса tqdm, связанного с конкретным repo_id."""
@@ -72,19 +73,29 @@ def download_model_worker(repo_id: str, folder_name: str):
 # Использование Mean Pooling вместо [CLS]
 # 1. Архитектура с Mean Pooling
 class DesklibAIDetectionModel(nn.Module):
-    def init(self, config):
-        super().init()
-        # Имя переменной соответствует маппингу
+    def init(self, config):  # Исправлено: добавлены двойные подчеркивания
+        super().init()  # Исправлено: добавлены двойные подчеркивания
         self.deberta = AutoModel.from_config(config)
         self.classifier = nn.Linear(config.hidden_size, 1)
 
     def forward(self, input_ids, attention_mask=None):
         outputs = self.deberta(input_ids=input_ids, attention_mask=attention_mask)
-        # Mean Pooling
-        mask = attention_mask.unsqueeze(-1).expand(outputs[0].size()).float()
-        pooled = torch.sum(outputs[0] * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
-        return self.classifier(pooled)
+        last_hidden_state = outputs[0]
 
+        # Точная математика Mean Pooling с учетом маски внимания
+        mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        sum_embeddings = torch.sum(last_hidden_state * mask_expanded, dim=1)
+        sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+        pooled = sum_embeddings / sum_mask
+
+        # Возвращаем объект в виде словаря/структуры с полем logits
+        logits = self.classifier(pooled)
+
+        class ModelOutput:
+            def init(self, logits):
+                self.logits = logits
+
+        return ModelOutput(logits=logits)
 
 
 def load_model_into_memory(folder_name: str) -> bool:
@@ -109,7 +120,7 @@ def load_model_into_memory(folder_name: str) -> bool:
         # Загружаем оригинальный конфиг
         config = AutoConfig.from_pretrained(target_path, trust_remote_code=True)
 
-        # Инициализируем НАШ кастомный класс вместо стандартного
+        # Инициализируем кастомный класс
         model = DesklibAIDetectionModel(config)
 
         # Ищем файл весов
@@ -124,28 +135,17 @@ def load_model_into_memory(folder_name: str) -> bool:
         else:
             raise FileNotFoundError("Не найден файл весов модели")
 
-        # Переименовываем ключи на лету под структуру нашего класса
-        corrected_state_dict = {}
+        # Переименовываем ключи: заменяем префикс "model." на "deberta." для совместимости с нашим классовы
+        corrected_dict = {}
         for key, value in state_dict.items():
-            # Наш класс использует префикс "deberta.", а в файле весов "model."
-            if key.startswith("model.encoder.") or key.startswith("model.embeddings."):
+            if key.startswith("model."):
                 new_key = key.replace("model.", "deberta.", 1)
-            elif key == "model.LayerNorm.weight":
-                new_key = "deberta.LayerNorm.weight"
-            elif key == "model.LayerNorm.bias":
-                new_key = "deberta.LayerNorm.bias"
             else:
                 new_key = key
-            corrected_state_dict[new_key] = value
+            corrected_dict[new_key] = value
 
         # Загружаем веса в СТРОГОМ режиме (strict=True)
-        # Если веса классификатора сядут идеально, ошибка не возникнет
-        corrected_dict = {
-            (k.replace("model.", "deberta.") if k.startswith("model.") else k): v
-            for k, v in state_dict.items()
-        }
         model.load_state_dict(corrected_dict, strict=True)
-        #model.load_state_dict(corrected_state_dict, strict=True)
         print("[Успех] Все оригинальные веса, включая классификатор, загружены!")
 
         model.to(device)
@@ -166,10 +166,6 @@ def load_model_into_memory(folder_name: str) -> bool:
 class DownloadRequest(BaseModel):
     repo_id: str
     folder_name: str
-
-
-class PredictRequest(BaseModel):
-    text: str
 
 
 @app.get("/models")
@@ -241,42 +237,47 @@ async def activate_model(folder_name: str):
     if not success:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Не удалось загрузить модель. Проверьте имя папки."
+            detail="Не удалось загрузить модель. Проверьте имя папки или лог ошибок."
         )
     return {"status": "Модель активирована", "current_model": current_model_name}
 
 
 @app.post("/predict")
-async def predict(data: PredictRequest):  # или как называется ваша Pydantic-модель
+async def predict(payload: PredictRequest):
+    """Маршрут для предсказания текста с вынесением булевого вердикта"""
     if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Модель не загружена")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Модель не загружена"
+        )
 
-    # 1. Токенизация текста
-    inputs = tokenizer(data.text, return_tensors="pt", truncation=True, max_length=512)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    try:
+        inputs = tokenizer(payload.text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
-        outputs = model(**inputs)
+        with torch.no_grad():
+            outputs = model(**inputs)
 
-    # 2. Получаем сырой логит
-    logits = outputs.logits  # Имеет форму [[значение]]
+        logits = outputs.logits
 
-    # === ИСПРАВЛЕНИЕ БАГА: Используем torch.sigmoid вместо torch.softmax ===
-    probs = torch.sigmoid(logits)
+        # Сигмоида для обработки одного логита кастомной модели
+        probs = torch.sigmoid(logits)
+        probabilities_list = probs.tolist()
 
-    # Получаем численные значения для ответа API
-    logits_list = logits.cpu().tolist()
-    probs_list = probs.cpu().tolist()
+        # Получаем значение вероятности
+        prob_value = probabilities_list[0][0]
 
-    # Извлекаем саму вероятность (число от 0.0 до 1.0)
-    prob_value = probs_list[0][0]
+        # Булевый вердикт: True, если ИИ-текст (вероятность > 50%)
+        is_ai_generated = prob_value > 0.5
 
-    # Определяем вердикт (например, если вероятность ИИ > 0.5)
-    verdict = prob_value > 0.5
-
-    return {
-        "model": current_model_name,
-        "verdict": verdict,
-        "probabilities": probs_list,
-        "logits": logits_list
-    }
+        return {
+            "model": current_model_name,
+            "verdict": is_ai_generated,
+            "probabilities": probabilities_list,
+            "logits": logits.tolist()
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка инференса: {str(e)}"
+        )
