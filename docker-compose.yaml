@@ -15,7 +15,7 @@ services:
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       # 1. Монтируем код приложения (изменения в app.py применятся мгновенно)
-      - .:/app
+#      - .:/app
       # 2. Оставляем монтирование папки с моделями, чтобы они не стирались
       - ./model_data:/app/models
     restart: unless-stopped
