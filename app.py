@@ -7,7 +7,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from huggingface_hub import model_info, snapshot_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
 app = FastAPI(title="Dynamic AI Text Detector API")
 
@@ -77,31 +77,41 @@ def load_model_into_memory(folder_name: str) -> bool:
         return False
 
     try:
-        # Безопасное освобождение памяти без удаления самих переменных
+        # 1. Безопасное освобождение памяти (устраняем NameError при сбоях)
         model = None
         tokenizer = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Загружаем токенизатор
-        # Загружаем токенизатор с разрешением кастомного кода
+        # 2. Загружаем токенизатор с поддержкой удаленного кода
         tokenizer = AutoTokenizer.from_pretrained(target_path, trust_remote_code=True)
 
-            # Используем базовый AutoModel с trust_remote_code=True
-        model = AutoModel.from_pretrained(
-            target_path,
-            trust_remote_code=True
-        )
+        # 3. Читаем конфигурацию модели напрямую из её папки
+        config = AutoConfig.from_pretrained(target_path, trust_remote_code=True)
 
-        model.to(device)  # device всегда "cpu"
+        # 4. Проверяем, является ли модель кастомной (как DesklibAIDetectionModel)
+        if hasattr(config, "auto_map") and "AutoModelForSequenceClassification" in config.auto_map:
+            # Если авторы прописали маппинг, загружаем через AutoModel с trust_remote_code
+            model = AutoModelForSequenceClassification.from_pretrained(
+                target_path,
+                config=config,
+                trust_remote_code=True
+            )
+        else:
+            # Если маппинга нет, загружаем модель напрямую через класс,
+            # который прописан в её конфигурации в поле architectures
+            from transformers import AutoModel
+            model = AutoModel.from_pretrained(target_path, config=config, trust_remote_code=True)
+
+        model.to(device)
         model.eval()
 
         current_model_name = folder_name
         return True
     except Exception as e:
         print(f"Ошибка активации модели {folder_name}: {e}")
-        # Гарантируем, что переменные не останутся в неопределенном состоянии
+        # Возвращаем переменные в безопасное состояние None
         model = None
         tokenizer = None
         current_model_name = None
