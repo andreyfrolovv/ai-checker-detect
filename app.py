@@ -73,8 +73,9 @@ def download_model_worker(repo_id: str, folder_name: str):
 # Использование Mean Pooling вместо [CLS]
 # 1. Архитектура с Mean Pooling
 class DesklibAIDetectionModel(nn.Module):
-    def init(self, config):  # Исправлено: добавлены двойные подчеркивания
-        super().init()  # Исправлено: добавлены двойные подчеркивания
+    def init(self, config=None, **kwargs):  # Принимает config принудительно
+        super().init()
+        # Если config не передан (хотя мы его передаем), берем базовый
         self.deberta = AutoModel.from_config(config)
         self.classifier = nn.Linear(config.hidden_size, 1)
 
@@ -88,7 +89,6 @@ class DesklibAIDetectionModel(nn.Module):
         sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
         pooled = sum_embeddings / sum_mask
 
-        # Возвращаем объект в виде словаря/структуры с полем logits
         logits = self.classifier(pooled)
 
         class ModelOutput:
