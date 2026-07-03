@@ -226,7 +226,7 @@ async def activate_model(folder_name: str):
 
 
 @app.post("/predict")
-async def predict(data: TextRequest):  # или как называется ваша Pydantic-модель
+async def predict(data: PredictRequest):  # или как называется ваша Pydantic-модель
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Модель не загружена")
 
