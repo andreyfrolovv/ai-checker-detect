@@ -85,7 +85,10 @@ def load_model_into_memory(folder_name: str) -> bool:
 
         # Загружаем модель сразу из локальной папки
         tokenizer = AutoTokenizer.from_pretrained(target_path)
-        model = AutoModelForSequenceClassification.from_pretrained(target_path)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_path,
+            ignore_mismatched_sizes=True
+        )
         model.to(device)  # device всегда "cpu"
         model.eval()
 
