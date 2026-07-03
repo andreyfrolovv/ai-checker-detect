@@ -67,6 +67,37 @@ def download_model_worker(repo_id: str, folder_name: str):
     except Exception as e:
         download_tasks[repo_id] = f"Ошибка: {str(e)}"
 
+
+# 1. Создаем точную кастомную архитектуру авторов модели
+class DesklibAIDetectionModel(nn.Module):
+    def init(self, config):
+        super().init()
+        # Базовая DeBERTa
+        self.deberta = DebertaV2Model(config)
+
+        # Финальный слой классификации — один линейный выход (1024 -> 1)
+        # Размерность 1024 берется из оригинального лога (ckpt: torch.Size([1, 1024]))
+        self.classifier = nn.Linear(config.hidden_size, 1)
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None):
+        outputs = self.deberta(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids
+        )
+
+        # Берем вектор первого токена [CLS] для классификации всего текста
+        cls_output = outputs.last_hidden_state[:, 0, :]
+
+        # Пропускаем через оригинальный классификатор
+        logits = self.classifier(cls_output)
+
+        # Возвращаем объект со свойством logits, чтобы не ломать остальной код инференса
+        from collections import namedtuple
+        ModelOutput = namedtuple("ModelOutput", ["logits"])
+        return ModelOutput(logits=logits)
+
+
 def load_model_into_memory(folder_name: str) -> bool:
     """Вспомогательная функция для переключения модели в ОЗУ (CPU)"""
     global model, tokenizer, current_model_name
@@ -83,17 +114,16 @@ def load_model_into_memory(folder_name: str) -> bool:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # 1. Загружаем токенизатор
+        # Загружаем токенизатор
         tokenizer = AutoTokenizer.from_pretrained(target_path, trust_remote_code=True)
 
-        # 2. Создаем чистую конфигурацию под 1 класс
+        # Загружаем оригинальный конфиг
         config = AutoConfig.from_pretrained(target_path, trust_remote_code=True)
-        config.num_labels = 1
 
-        # 3. Инициализируем пустую модель (без загрузки весов)
-        model = DebertaV2ForSequenceClassification(config)
+        # Инициализируем НАШ кастомный класс вместо стандартного
+        model = DesklibAIDetectionModel(config)
 
-        # 4. Находим файл весов в папке (safetensors или bin)
+        # Ищем файл весов
         safetensors_path = os.path.join(target_path, "model.safetensors")
         bin_path = os.path.join(target_path, "pytorch_model.bin")
 
@@ -103,29 +133,26 @@ def load_model_into_memory(folder_name: str) -> bool:
         elif os.path.exists(bin_path):
             state_dict = torch.load(bin_path, map_location="cpu")
         else:
-            raise FileNotFoundError("Не найден файл весов модели (model.safetensors или pytorch_model.bin)")
+            raise FileNotFoundError("Не найден файл весов модели")
 
-        # 5. Переименовываем ключи на лету: заменяем префикс "model." на "deberta."
+        # Переименовываем ключи на лету под структуру нашего класса
         corrected_state_dict = {}
         for key, value in state_dict.items():
+            # Наш класс использует префикс "deberta.", а в файле весов "model."
             if key.startswith("model.encoder.") or key.startswith("model.embeddings."):
                 new_key = key.replace("model.", "deberta.", 1)
             elif key == "model.LayerNorm.weight":
-                new_key = "deberta.encoder.LayerNorm.weight"
+                new_key = "deberta.LayerNorm.weight"
             elif key == "model.LayerNorm.bias":
-                new_key = "deberta.encoder.LayerNorm.bias"
+                new_key = "deberta.LayerNorm.bias"
             else:
                 new_key = key
             corrected_state_dict[new_key] = value
 
-        # 6. Загружаем исправленные веса в модель
-        missing_keys, unexpected_keys = model.load_state_dict(corrected_state_dict, strict=False)
-
-        # Логируем результат для контроля, если что-то пойдет не так
-        if missing_keys:
-            print(f"[Дебаг] Пропущенные ключи: {missing_keys}")
-        if unexpected_keys:
-            print(f"[Дебаг] Лишние ключи: {unexpected_keys}")
+        # Загружаем веса в СТРОГОМ режиме (strict=True)
+        # Если веса классификатора сядут идеально, ошибка не возникнет
+        model.load_state_dict(corrected_state_dict, strict=True)
+        print("[Успех] Все оригинальные веса, включая классификатор, загружены!")
 
         model.to(device)
         model.eval()
