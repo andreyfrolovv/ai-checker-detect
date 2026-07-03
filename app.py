@@ -76,19 +76,22 @@ def load_model_into_memory(folder_name: str) -> bool:
         return False
 
     try:
-        # Явно освобождаем оперативную память от старой модели
-        del model
-        del tokenizer
+        # Безопасное освобождение памяти без удаления самих переменных
+        model = None
+        tokenizer = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Загружаем модель сразу из локальной папки
+        # Загружаем токенизатор
         tokenizer = AutoTokenizer.from_pretrained(target_path)
+
+        # Загружаем модель с флагом ignore_mismatched_sizes=True
         model = AutoModelForSequenceClassification.from_pretrained(
-            model_path,
-            ignore_mismatched_sizes=True
+            target_path,
+            ignore_mismatched_sizes=True  # <-- Исправляет первую ошибку со слоями
         )
+
         model.to(device)  # device всегда "cpu"
         model.eval()
 
@@ -96,6 +99,10 @@ def load_model_into_memory(folder_name: str) -> bool:
         return True
     except Exception as e:
         print(f"Ошибка активации модели {folder_name}: {e}")
+        # Гарантируем, что переменные не останутся в неопределенном состоянии
+        model = None
+        tokenizer = None
+        current_model_name = None
         return False
 
 
