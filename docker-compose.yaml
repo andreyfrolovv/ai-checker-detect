@@ -9,7 +9,6 @@ services:
     environment:
       - WATCHFILES_FORCE_POLLING=true
       - PYTHONDONTWRITEBYTECODE=1
-      - API_KEY=my_secure_secret_token_2026
     # Добавляем команду с флагом --reload для автоперезапуска Python-кода
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
     volumes:

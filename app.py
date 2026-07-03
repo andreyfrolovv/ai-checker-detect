@@ -1,17 +1,17 @@
 import os
-from fastapi import FastAPI, HTTPException, Security, status, BackgroundTasks
-from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel
+import gc
 import torch
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from pydantic import BaseModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from huggingface_hub import model_info
+from huggingface_hub.utils import RepositoryNotFoundError
 
 app = FastAPI(title="Dynamic AI Text Detector API")
 
 # Конфигурация путей и безопасности
 MODELS_DIR = os.getenv("MODELS_DIR", "./models")
-API_KEY = os.getenv("API_KEY", "my_secure_secret_token_2026")
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Глобальные переменные для активной модели
 current_model_name = None
@@ -22,14 +22,11 @@ device = "cpu"
 # Статусы фонового скачивания моделей
 download_tasks = {}
 
-
-async def get_api_key(api_key_header: str = Security(api_key_header)):
-    if api_key_header == API_KEY:
-        return api_key_header
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Неверный или отсутствующий API Ключ"
-    )
+# Маппинг классов для вердикта (измените индексы под вашу модель, если необходимо)
+LABELS = {
+    0: "Текст написан человеком",
+    1: "Текст сгенерирован ИИ"
+}
 
 
 def download_model_worker(repo_id: str, folder_name: str):
@@ -60,9 +57,11 @@ def load_model_into_memory(folder_name: str) -> bool:
 
     try:
         # Явно освобождаем оперативную память от старой модели
-        global model, tokenizer
-        model = None
-        tokenizer = None
+        del model
+        del tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Загружаем модель сразу на CPU
         tokenizer = AutoTokenizer.from_pretrained(target_path)
@@ -80,113 +79,122 @@ def load_model_into_memory(folder_name: str) -> bool:
 # --- МАРШРУТЫ API ---
 
 class DownloadRequest(BaseModel):
-    repo_id: str  # Пример: "desklib/ai-text-detector-v1.01"
+    repo_id: str
+    folder_name: str
 
 
-@app.post("/api/models/download")
-async def download_model(request: DownloadRequest, background_tasks: BackgroundTasks,
-                         api_key: str = Security(get_api_key)):
-    """Маршрут 1: Передаем ID модели с Hugging Face, и Python скачивает его в фоне"""
-    repo_id = request.repo_id.strip()
-    if not repo_id:
-        raise HTTPException(status_code=400, detail="repo_id не может быть пустым")
-
-    # Превращаем слэш в дефис для имени папки (например, desklib-ai-text-detector-v1.01)
-    folder_name = repo_id.replace("/", "-")
-    target_path = os.path.join(MODELS_DIR, folder_name)
-
-    if os.path.exists(target_path) and repo_id not in download_tasks:
-        return {"message": "Модель уже скачана ранее", "folder_name": folder_name}
-
-    if repo_id in download_tasks and download_tasks[repo_id] == "Скачивание началось...":
-        return {"message": "Модель уже находится в процессе загрузки", "status": download_tasks[repo_id]}
-
-    # Запускаем асинхронное скачивание в фоне, чтобы API не зависало
-    background_tasks.add_task(download_model_worker, repo_id, folder_name)
-
-    return {"message": "Процесс загрузки запущен в фоновом режиме", "folder_name": folder_name}
-
-
-@app.get("/api/models")
-async def list_models(api_key: str = Security(get_api_key)):
-    """Маршрут 2: Выводит список всех доступных локально моделей и текущих загрузок"""
-    local_models = []
-    if os.path.exists(MODELS_DIR):
-        # Сканируем папку на наличие подпапок с моделями
-        for name in os.listdir(MODELS_DIR):
-            if os.path.isdir(os.path.join(MODELS_DIR, name)):
-                local_models.append(name)
-
-    return {
-        "active_model": current_model_name if current_model_name else "Ни одна модель не активирована",
-        "available_local_models": local_models,
-        "active_download_statuses": download_tasks
-    }
-
-
-class ActivateRequest(BaseModel):
-    folder_name: str  # Имя папки из списка доступных моделей
-
-
-@app.post("/api/models/activate")
-async def activate_model(request: ActivateRequest, api_key: str = Security(get_api_key)):
-    """Дополнительный маршрут: Переключение активной модели в оперативной памяти"""
-    success = load_model_into_memory(request.folder_name)
-    if not success:
-        raise HTTPException(status_code=400,
-                            detail=f"Не удалось загрузить модель {request.folder_name}. Проверьте логи или статус загрузки.")
-    return {"message": f"Модель {request.folder_name} успешно активирована!"}
-
-
-class TextRequest(BaseModel):
+class PredictRequest(BaseModel):
     text: str
 
 
-@app.post("/api/detect")
-async def detect_text(request: TextRequest, api_key: str = Security(get_api_key)):
-    """Основной маршрут детекции текста, работающий только на CPU"""
-    if model is None or tokenizer is None:
+@app.get("/models")
+async def list_models():
+    """Маршрут для просмотра всех локальных и скачиваемых моделей"""
+    result = {}
+
+    # 1. Сканируем локальную директорию на наличие уже скачанных моделей
+    if os.path.exists(MODELS_DIR):
+        for entry in os.scandir(MODELS_DIR):
+            if entry.is_dir():
+                folder_name = entry.name
+                if folder_name == current_model_name:
+                    result[folder_name] = "Активирована"
+                else:
+                    result[folder_name] = "Скачана (не активна)"
+
+    # 2. Добавляем в список модели, которые сейчас скачиваются в фоне
+    for repo_id, current_status in download_tasks.items():
+        if current_status == "Скачивание началось...":
+            result[repo_id] = "Скачивается..."
+
+    return {"models": result}
+
+
+@app.post("/download", status_code=status.HTTP_202_ACCEPTED)
+async def download_model(payload: DownloadRequest, background_tasks: BackgroundTasks):
+    """Маршрут для запуска скачивания модели"""
+    repo_id = payload.repo_id
+    folder_name = payload.folder_name
+
+    # Проверка: не выполняется ли скачивание сейчас
+    if download_tasks.get(repo_id) == "Скачивание началось...":
         raise HTTPException(
-            status_code=400,
-            detail="На сервере не активирована ни одна модель. Сначала вызовите /api/models/activate"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Модель уже скачивается"
         )
 
-    clean_text = request.text.strip()
-    if not clean_text:
-        return {"confidence_score": 0.0, "is_ai_generated": False, "message": "Пустой текст"}
+    # Валидация: проверка существования модели на Hugging Face до запуска фонового потока
+    try:
+        model_info(repo_id)
+    except RepositoryNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Репозиторий '{repo_id}' не найден на Hugging Face"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Ошибка проверки репозитория: {str(e)}"
+        )
+
+    background_tasks.add_task(download_model_worker, repo_id, folder_name)
+    return {"status": "Скачивание началось в фоновом режиме", "repo_id": repo_id}
+
+
+@app.get("/download/status/{repo_id:path}")
+async def get_status(repo_id: str):
+    """Маршрут для проверки статуса скачивания"""
+    status_msg = download_tasks.get(repo_id, "Не найдено")
+    return {"repo_id": repo_id, "status": status_msg}
+
+
+@app.post("/activate")
+async def activate_model(folder_name: str):
+    """Маршрут для активации локальной модели"""
+    success = load_model_into_memory(folder_name)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Не удалось загрузить модель. Проверьте имя папки."
+        )
+    return {"status": "Модель активирована", "current_model": current_model_name}
+
+
+@app.post("/predict")
+async def predict(payload: PredictRequest):
+    """Маршрут для предсказания текста с вынесением булевого вердикта"""
+    if model is None or tokenizer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Модель не загружена"
+        )
 
     try:
-        # Токенизация текста
-        inputs = tokenizer(clean_text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = tokenizer(payload.text, return_tensors="pt", truncation=True, max_length=512)
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        # Инференс без расчета градиентов
         with torch.no_grad():
             outputs = model(**inputs)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1).squeeze()
 
-        # Проверка, что модель вернула распределение как минимум для двух классов
-        if probs.dim() == 0 or len(probs) < 2:
-            raise HTTPException(status_code=500, detail="Модель вернула некорректное количество классов.")
+        logits = outputs.logits
+        # Рассчитываем вероятности
+        probs = torch.softmax(logits, dim=-1)
+        probabilities_list = probs.tolist()
 
-        # Извлечение вероятностей по индексам
-        human_prob = probs[0].item()
-        ai_prob = probs[1].item()
+        # Находим индекс класса с максимальной вероятностью
+        predicted_class_id = torch.argmax(probs, dim=-1).item()
 
-        is_ai = ai_prob > human_prob
-        final_score = ai_prob if is_ai else human_prob
+        # Булевый вердикт: True если ИИ (класс 1), False если человек (класс 0)
+        is_ai_generated = (predicted_class_id == 1)
 
         return {
-            "is_ai_generated": is_ai,
-            "confidence_score": round(final_score, 4),
-            "probabilities": {
-                "human": round(human_prob, 4),
-                "ai": round(ai_prob, 4)
-            },
-            "active_model_used": current_model_name,
-            "text_preview": clean_text[:50] + "..." if len(clean_text) > 50 else clean_text
+            "model": current_model_name,
+            "is_text_ai": is_ai_generated,  # Возвращает true или false
+            "probabilities": probabilities_list,
+            "logits": logits.tolist()
         }
-
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка инференса: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка инференса: {str(e)}"
+        )
