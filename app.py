@@ -70,25 +70,21 @@ def download_model_worker(repo_id: str, folder_name: str):
         download_tasks[repo_id] = f"Ошибка: {str(e)}"
 
 # Использование Mean Pooling вместо [CLS]
-class DesklibAIDetectionModel(PreTrainedModel):
-    config_class = AutoConfig
+# 1. Архитектура с Mean Pooling
+class DesklibAIDetectionModel(nn.Module):
     def init(self, config):
-        super().init(config)
-        self.model = AutoModel.from_config(config) # Использование self.model
+        super().init()
+        # Имя переменной соответствует маппингу
+        self.deberta = AutoModel.from_config(config)
         self.classifier = nn.Linear(config.hidden_size, 1)
-        self.init_weights()
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
-        outputs = self.model(input_ids, attention_mask=attention_mask)
-        # Реализация Mean Pooling
-        mask_expanded = attention_mask.unsqueeze(-1).expand(outputs[0].size()).float()
-        pooled = torch.sum(outputs[0] * mask_expanded, dim=1) / torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-        return {"logits": self.classifier(pooled)} # Формат вывода
+    def forward(self, input_ids, attention_mask=None):
+        outputs = self.deberta(input_ids=input_ids, attention_mask=attention_mask)
+        # Mean Pooling
+        mask = attention_mask.unsqueeze(-1).expand(outputs[0].size()).float()
+        pooled = torch.sum(outputs[0] * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
+        return self.classifier(pooled)
 
-# Загрузка через from_pretrained
-def load_model_into_memory(folder_name: str) -> bool:
-    # ... (код загрузки с DesklibAIDetectionModel.from_pretrained)
-    pass
 
 
 def load_model_into_memory(folder_name: str) -> bool:
@@ -144,7 +140,12 @@ def load_model_into_memory(folder_name: str) -> bool:
 
         # Загружаем веса в СТРОГОМ режиме (strict=True)
         # Если веса классификатора сядут идеально, ошибка не возникнет
-        model.load_state_dict(corrected_state_dict, strict=True)
+        corrected_dict = {
+            (k.replace("model.", "deberta.") if k.startswith("model.") else k): v
+            for k, v in state_dict.items()
+        }
+        model.load_state_dict(corrected_dict, strict=True)
+        #model.load_state_dict(corrected_state_dict, strict=True)
         print("[Успех] Все оригинальные веса, включая классификатор, загружены!")
 
         model.to(device)
