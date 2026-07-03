@@ -4,8 +4,9 @@ import torch
 from fastapi import FastAPI, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from huggingface_hub import model_info
+from huggingface_hub import model_info, snapshot_download
 from huggingface_hub.utils import RepositoryNotFoundError
+from tqdm.auto import tqdm
 
 app = FastAPI(title="Dynamic AI Text Detector API")
 
@@ -22,25 +23,44 @@ device = "cpu"
 # Статусы фонового скачивания моделей
 download_tasks = {}
 
-# Маппинг классов для вердикта (измените индексы под вашу модель, если необходимо)
-LABELS = {
-    0: "Текст написан человеком",
-    1: "Текст сгенерирован ИИ"
-}
+
+def create_progress_tracker(repo_id: str):
+    """Фабрика для создания класса tqdm, связанного с конкретным repo_id."""
+
+    class TrackDownloadProgress(tqdm):
+        def display(self, *args, **kwargs):
+            super().display(*args, **kwargs)
+            # Переводим байты в мегабайты
+            downloaded_mb = self.n / (1024 * 1024)
+            total_mb = self.total / (1024 * 1024) if self.total else 0
+
+            if total_mb > 0:
+                percent = (self.n / self.total) * 100
+                status_str = f"Скачивание: {downloaded_mb:.1f}MB из {total_mb:.1f}MB ({percent:.1f}%)"
+            else:
+                status_str = f"Скачивание: {downloaded_mb:.1f}MB"
+
+            # Записываем статус в глобальный словарь
+            download_tasks[repo_id] = status_str
+
+    return TrackDownloadProgress
 
 
 def download_model_worker(repo_id: str, folder_name: str):
-    """Фоновая функция для скачивания модели с Hugging Face"""
+    """Фоновая функция для скачивания модели с отслеживанием прогресса."""
     target_path = os.path.join(MODELS_DIR, folder_name)
     try:
-        download_tasks[repo_id] = "Скачивание началось..."
+        download_tasks[repo_id] = "Подготовка к скачиванию..."
 
-        # Скачиваем и сохраняем локально
-        temp_tokenizer = AutoTokenizer.from_pretrained(repo_id)
-        temp_model = AutoModelForSequenceClassification.from_pretrained(repo_id)
+        # Динамически создаем класс трекера конкретно под этот репозиторий
+        progress_tracker_class = create_progress_tracker(repo_id)
 
-        temp_tokenizer.save_pretrained(target_path)
-        temp_model.save_pretrained(target_path)
+        # Ошибка исправлена: убран не поддерживаемый аргумент desc
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=target_path,
+            tqdm_class=progress_tracker_class
+        )
 
         download_tasks[repo_id] = "Успешно скачано"
     except Exception as e:
@@ -63,7 +83,7 @@ def load_model_into_memory(folder_name: str) -> bool:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Загружаем модель сразу на CPU
+        # Загружаем модель сразу из локальной папки
         tokenizer = AutoTokenizer.from_pretrained(target_path)
         model = AutoModelForSequenceClassification.from_pretrained(target_path)
         model.to(device)  # device всегда "cpu"
@@ -104,8 +124,8 @@ async def list_models():
 
     # 2. Добавляем в список модели, которые сейчас скачиваются в фоне
     for repo_id, current_status in download_tasks.items():
-        if current_status == "Скачивание началось...":
-            result[repo_id] = "Скачивается..."
+        if "Скачивание" in current_status or "Подготовка" in current_status:
+            result[repo_id] = current_status
 
     return {"models": result}
 
@@ -117,7 +137,8 @@ async def download_model(payload: DownloadRequest, background_tasks: BackgroundT
     folder_name = payload.folder_name
 
     # Проверка: не выполняется ли скачивание сейчас
-    if download_tasks.get(repo_id) == "Скачивание началось...":
+    current_status = download_tasks.get(repo_id, "")
+    if "Скачивание" in current_status or "Подготовка" in current_status:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Модель уже скачивается"
@@ -177,11 +198,9 @@ async def predict(payload: PredictRequest):
             outputs = model(**inputs)
 
         logits = outputs.logits
-        # Рассчитываем вероятности
         probs = torch.softmax(logits, dim=-1)
         probabilities_list = probs.tolist()
 
-        # Находим индекс класса с максимальной вероятностью
         predicted_class_id = torch.argmax(probs, dim=-1).item()
 
         # Булевый вердикт: True если ИИ (класс 1), False если человек (класс 0)
@@ -189,7 +208,7 @@ async def predict(payload: PredictRequest):
 
         return {
             "model": current_model_name,
-            "is_text_ai": is_ai_generated,  # Возвращает true или false
+            "verdict": is_ai_generated,
             "probabilities": probabilities_list,
             "logits": logits.tolist()
         }
