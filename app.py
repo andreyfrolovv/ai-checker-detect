@@ -51,7 +51,7 @@ def download_model_worker(repo_id: str, folder_name: str):
 
 
 def load_model_into_memory(folder_name: str) -> bool:
-    """Вспомогательная функция для переключения модели в ОЗУ"""
+    """Вспомогательная функция для переключения модели в ОЗУ (CPU)"""
     global model, tokenizer, current_model_name
     target_path = os.path.join(MODELS_DIR, folder_name)
 
@@ -59,10 +59,17 @@ def load_model_into_memory(folder_name: str) -> bool:
         return False
 
     try:
+        # Явно освобождаем оперативную память от старой модели
+        global model, tokenizer
+        model = None
+        tokenizer = None
+
+        # Загружаем модель сразу на CPU
         tokenizer = AutoTokenizer.from_pretrained(target_path)
         model = AutoModelForSequenceClassification.from_pretrained(target_path)
-        model.to(device)
+        model.to(device)  # device всегда "cpu"
         model.eval()
+
         current_model_name = folder_name
         return True
     except Exception as e:
@@ -137,7 +144,7 @@ class TextRequest(BaseModel):
 
 @app.post("/api/detect")
 async def detect_text(request: TextRequest, api_key: str = Security(get_api_key)):
-    """Основной маршрут детекции текста"""
+    """Основной маршрут детекции текста, работающий только на CPU"""
     if model is None or tokenizer is None:
         raise HTTPException(
             status_code=400,
@@ -148,35 +155,38 @@ async def detect_text(request: TextRequest, api_key: str = Security(get_api_key)
     if not clean_text:
         return {"confidence_score": 0.0, "is_ai_generated": False, "message": "Пустой текст"}
 
-    inputs = tokenizer(clean_text, return_tensors="pt", truncation=True, max_length=512).to(device)
+    try:
+        # Токенизация текста
+        inputs = tokenizer(clean_text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    # Быстрый расчет без градиентов
-    with torch.no_grad():
-        outputs = model(**inputs)
-        logits = outputs.logits
-        # Применяем Softmax для получения явных вероятностей для каждого класса
-        probs = torch.softmax(logits, dim=-1).squeeze()
+        # Инференс без расчета градиентов
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=-1).squeeze()
 
-    # ИСПРАВЛЕНИЕ: Извлекаем элементы по индексам из двухэлементного тензора
-    # Для большинства бинарных классификаторов RoBERTa:
-    # Индекс 0 - HUMAN (REAL), Индекс 1 - AI (FAKE)
-    if probs.dim() == 0:  # На случай если squeeze() вернул скаляр для батча из 1 элемента
-        raise HTTPException(status_code=500, detail="Ошибка размерности тензора модели.")
+        # Проверка, что модель вернула распределение как минимум для двух классов
+        if probs.dim() == 0 or len(probs) < 2:
+            raise HTTPException(status_code=500, detail="Модель вернула некорректное количество классов.")
 
-    human_prob = probs[0].item()
-    ai_prob = probs[1].item()
+        # Извлечение вероятностей по индексам
+        human_prob = probs[0].item()
+        ai_prob = probs[1].item()
 
-    # Логика определения автора текста
-    is_ai = ai_prob > human_prob
-    final_score = ai_prob if is_ai else human_prob
+        is_ai = ai_prob > human_prob
+        final_score = ai_prob if is_ai else human_prob
 
-    return {
-        "is_ai_generated": is_ai,
-        "confidence_score": round(final_score, 4),
-        "probabilities": {
-            "human": round(human_prob, 4),
-            "ai": round(ai_prob, 4)
-        },
-        "active_model_used": current_model_name,
-        "text_preview": clean_text[:50] + "..." if len(clean_text) > 50 else clean_text
-    }
+        return {
+            "is_ai_generated": is_ai,
+            "confidence_score": round(final_score, 4),
+            "probabilities": {
+                "human": round(human_prob, 4),
+                "ai": round(ai_prob, 4)
+            },
+            "active_model_used": current_model_name,
+            "text_preview": clean_text[:50] + "..." if len(clean_text) > 50 else clean_text
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка инференса: {str(e)}")
