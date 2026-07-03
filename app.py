@@ -7,6 +7,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from huggingface_hub import model_info, snapshot_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModel
 
 app = FastAPI(title="Dynamic AI Text Detector API")
 
@@ -85,15 +86,12 @@ def load_model_into_memory(folder_name: str) -> bool:
 
         # Загружаем токенизатор
         # Загружаем токенизатор с разрешением кастомного кода
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(target_path, trust_remote_code=True)
+
+            # Используем базовый AutoModel с trust_remote_code=True
+        model = AutoModel.from_pretrained(
             target_path,
             trust_remote_code=True
-        )
-
-        # Загружаем модель с разрешением кастомного кода (БЕЗ ignore_mismatched_sizes)
-        model = AutoModelForSequenceClassification.from_pretrained(
-            target_path,
-            trust_remote_code=True  # <-- ЭТОТ ФЛАГ ЗАСТАВИТ ИСПОЛЬЗОВАТЬ DesklibAIDetectionModel
         )
 
         model.to(device)  # device всегда "cpu"
