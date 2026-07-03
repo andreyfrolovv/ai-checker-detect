@@ -7,7 +7,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from huggingface_hub import model_info, snapshot_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm.auto import tqdm
-from transformers import DebertaV3ForSequenceClassification, AutoConfig, AutoTokenizer
+from transformers import DebertaV2ForSequenceClassification, AutoConfig, AutoTokenizer
 
 app = FastAPI(title="Dynamic AI Text Detector API")
 
@@ -87,16 +87,16 @@ def load_model_into_memory(folder_name: str) -> bool:
         # 1. Загружаем токенизатор
         tokenizer = AutoTokenizer.from_pretrained(target_path, trust_remote_code=True)
 
-        # 2. Загружаем и жестко корректируем конфигурацию под веса модели
+        # 2. Корректируем конфиг под 1 выходной класс модели (как в safetensors)
         config = AutoConfig.from_pretrained(target_path, trust_remote_code=True)
-        config.num_labels = 1  # Исправляет MISMATCH (размер классификатора)
+        config.num_labels = 1
 
-        # 3. Загружаем напрямую класс DebertaV3 с исправлением маппинга ключей
-        # Использование сопоставления DebertaV3 решает проблему структуры "model." vs "deberta."
-        model = DebertaV3ForSequenceClassification.from_pretrained(
+        # 3. Загружаем точный класс DebertaV2
+        model = DebertaV2ForSequenceClassification.from_pretrained(
             target_path,
             config=config,
-            ignore_mismatched_sizes=True  # Разрешаем сопоставить слои после изменения num_labels
+            trust_remote_code=True,
+            ignore_mismatched_sizes=True  # Поможет сопоставить веса model. и deberta.
         )
 
         model.to(device)
