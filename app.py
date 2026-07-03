@@ -7,7 +7,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from huggingface_hub import model_info, snapshot_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm.auto import tqdm
-from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import DebertaV3ForSequenceClassification, AutoConfig, AutoTokenizer
 
 app = FastAPI(title="Dynamic AI Text Detector API")
 
@@ -77,32 +77,27 @@ def load_model_into_memory(folder_name: str) -> bool:
         return False
 
     try:
-        # 1. Безопасное освобождение памяти (устраняем NameError при сбоях)
+        # Безопасное освобождение памяти
         model = None
         tokenizer = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # 2. Загружаем токенизатор с поддержкой удаленного кода
+        # 1. Загружаем токенизатор
         tokenizer = AutoTokenizer.from_pretrained(target_path, trust_remote_code=True)
 
-        # 3. Читаем конфигурацию модели напрямую из её папки
+        # 2. Загружаем и жестко корректируем конфигурацию под веса модели
         config = AutoConfig.from_pretrained(target_path, trust_remote_code=True)
+        config.num_labels = 1  # Исправляет MISMATCH (размер классификатора)
 
-        # 4. Проверяем, является ли модель кастомной (как DesklibAIDetectionModel)
-        if hasattr(config, "auto_map") and "AutoModelForSequenceClassification" in config.auto_map:
-            # Если авторы прописали маппинг, загружаем через AutoModel с trust_remote_code
-            model = AutoModelForSequenceClassification.from_pretrained(
-                target_path,
-                config=config,
-                trust_remote_code=True
-            )
-        else:
-            # Если маппинга нет, загружаем модель напрямую через класс,
-            # который прописан в её конфигурации в поле architectures
-            from transformers import AutoModel
-            model = AutoModel.from_pretrained(target_path, config=config, trust_remote_code=True)
+        # 3. Загружаем напрямую класс DebertaV3 с исправлением маппинга ключей
+        # Использование сопоставления DebertaV3 решает проблему структуры "model." vs "deberta."
+        model = DebertaV3ForSequenceClassification.from_pretrained(
+            target_path,
+            config=config,
+            ignore_mismatched_sizes=True  # Разрешаем сопоставить слои после изменения num_labels
+        )
 
         model.to(device)
         model.eval()
@@ -111,7 +106,6 @@ def load_model_into_memory(folder_name: str) -> bool:
         return True
     except Exception as e:
         print(f"Ошибка активации модели {folder_name}: {e}")
-        # Возвращаем переменные в безопасное состояние None
         model = None
         tokenizer = None
         current_model_name = None
