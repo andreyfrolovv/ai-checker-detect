@@ -84,12 +84,16 @@ def load_model_into_memory(folder_name: str) -> bool:
             torch.cuda.empty_cache()
 
         # Загружаем токенизатор
-        tokenizer = AutoTokenizer.from_pretrained(target_path)
+        # Загружаем токенизатор с разрешением кастомного кода
+        tokenizer = AutoTokenizer.from_pretrained(
+            target_path,
+            trust_remote_code=True
+        )
 
-        # Загружаем модель с флагом ignore_mismatched_sizes=True
+        # Загружаем модель с разрешением кастомного кода (БЕЗ ignore_mismatched_sizes)
         model = AutoModelForSequenceClassification.from_pretrained(
             target_path,
-            ignore_mismatched_sizes=True  # <-- Исправляет первую ошибку со слоями
+            trust_remote_code=True  # <-- ЭТОТ ФЛАГ ЗАСТАВИТ ИСПОЛЬЗОВАТЬ DesklibAIDetectionModel
         )
 
         model.to(device)  # device всегда "cpu"
