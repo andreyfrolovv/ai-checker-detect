@@ -67,7 +67,6 @@ def download_model_worker(repo_id: str, folder_name: str):
     except Exception as e:
         download_tasks[repo_id] = f"Ошибка: {str(e)}"
 
-
 def load_model_into_memory(folder_name: str) -> bool:
     """Вспомогательная функция для переключения модели в ОЗУ (CPU)"""
     global model, tokenizer, current_model_name
@@ -87,17 +86,46 @@ def load_model_into_memory(folder_name: str) -> bool:
         # 1. Загружаем токенизатор
         tokenizer = AutoTokenizer.from_pretrained(target_path, trust_remote_code=True)
 
-        # 2. Корректируем конфиг под 1 выходной класс модели (как в safetensors)
+        # 2. Создаем чистую конфигурацию под 1 класс
         config = AutoConfig.from_pretrained(target_path, trust_remote_code=True)
         config.num_labels = 1
 
-        # 3. Загружаем точный класс DebertaV2
-        model = DebertaV2ForSequenceClassification.from_pretrained(
-            target_path,
-            config=config,
-            trust_remote_code=True,
-            ignore_mismatched_sizes=True  # Поможет сопоставить веса model. и deberta.
-        )
+        # 3. Инициализируем пустую модель (без загрузки весов)
+        model = DebertaV2ForSequenceClassification(config)
+
+        # 4. Находим файл весов в папке (safetensors или bin)
+        safetensors_path = os.path.join(target_path, "model.safetensors")
+        bin_path = os.path.join(target_path, "pytorch_model.bin")
+
+        if os.path.exists(safetensors_path):
+            from safetensors.torch import load_file
+            state_dict = load_file(safetensors_path)
+        elif os.path.exists(bin_path):
+            state_dict = torch.load(bin_path, map_location="cpu")
+        else:
+            raise FileNotFoundError("Не найден файл весов модели (model.safetensors или pytorch_model.bin)")
+
+        # 5. Переименовываем ключи на лету: заменяем префикс "model." на "deberta."
+        corrected_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("model.encoder.") or key.startswith("model.embeddings."):
+                new_key = key.replace("model.", "deberta.", 1)
+            elif key == "model.LayerNorm.weight":
+                new_key = "deberta.encoder.LayerNorm.weight"
+            elif key == "model.LayerNorm.bias":
+                new_key = "deberta.encoder.LayerNorm.bias"
+            else:
+                new_key = key
+            corrected_state_dict[new_key] = value
+
+        # 6. Загружаем исправленные веса в модель
+        missing_keys, unexpected_keys = model.load_state_dict(corrected_state_dict, strict=False)
+
+        # Логируем результат для контроля, если что-то пойдет не так
+        if missing_keys:
+            print(f"[Дебаг] Пропущенные ключи: {missing_keys}")
+        if unexpected_keys:
+            print(f"[Дебаг] Лишние ключи: {unexpected_keys}")
 
         model.to(device)
         model.eval()
