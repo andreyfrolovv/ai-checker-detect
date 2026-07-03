@@ -1,6 +1,7 @@
 import os
 import gc
 import torch
+import torch.nn as nn
 from fastapi import FastAPI, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -8,6 +9,7 @@ from huggingface_hub import model_info, snapshot_download
 from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm.auto import tqdm
 from transformers import DebertaV2ForSequenceClassification, AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer, AutoConfig, AutoModel, PreTrainedModel
 # робочее состояние
 app = FastAPI(title="Dynamic AI Text Detector API")
 
@@ -67,35 +69,26 @@ def download_model_worker(repo_id: str, folder_name: str):
     except Exception as e:
         download_tasks[repo_id] = f"Ошибка: {str(e)}"
 
-
-# 1. Создаем точную кастомную архитектуру авторов модели
-class DesklibAIDetectionModel(nn.Module):
+# Использование Mean Pooling вместо [CLS]
+class DesklibAIDetectionModel(PreTrainedModel):
+    config_class = AutoConfig
     def init(self, config):
-        super().init()
-        # Базовая DeBERTa
-        self.deberta = DebertaV2Model(config)
-
-        # Финальный слой классификации — один линейный выход (1024 -> 1)
-        # Размерность 1024 берется из оригинального лога (ckpt: torch.Size([1, 1024]))
+        super().init(config)
+        self.model = AutoModel.from_config(config) # Использование self.model
         self.classifier = nn.Linear(config.hidden_size, 1)
+        self.init_weights()
 
-    def forward(self, input_ids, attention_mask=None, token_type_ids=None):
-        outputs = self.deberta(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids
-        )
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        outputs = self.model(input_ids, attention_mask=attention_mask)
+        # Реализация Mean Pooling
+        mask_expanded = attention_mask.unsqueeze(-1).expand(outputs[0].size()).float()
+        pooled = torch.sum(outputs[0] * mask_expanded, dim=1) / torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+        return {"logits": self.classifier(pooled)} # Формат вывода
 
-        # Берем вектор первого токена [CLS] для классификации всего текста
-        cls_output = outputs.last_hidden_state[:, 0, :]
-
-        # Пропускаем через оригинальный классификатор
-        logits = self.classifier(cls_output)
-
-        # Возвращаем объект со свойством logits, чтобы не ломать остальной код инференса
-        from collections import namedtuple
-        ModelOutput = namedtuple("ModelOutput", ["logits"])
-        return ModelOutput(logits=logits)
+# Загрузка через from_pretrained
+def load_model_into_memory(folder_name: str) -> bool:
+    # ... (код загрузки с DesklibAIDetectionModel.from_pretrained)
+    pass
 
 
 def load_model_into_memory(folder_name: str) -> bool:
