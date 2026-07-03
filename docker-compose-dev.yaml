@@ -2,13 +2,18 @@ version: '3.8'
 
 services:
   dechecker-backend:
-    build: .
+    build: model_data
     container_name: dechecker_api
     ports:
       - "8000:8000"
     environment:
-      - API_KEY=my_secure_secret_token_2026
+      - WATCHFILES_FORCE_POLLING=true
+      - PYTHONDONTWRITEBYTECODE=1
+    # Добавляем команду с флагом --reload для автоперезапуска Python-кода
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
     volumes:
-      # Модели будут скачиваться в эту локальную папку на вашем ПК
+      # 1. Монтируем код приложения (изменения в app.py применятся мгновенно)
+      - .:/app
+      # 2. Оставляем монтирование папки с моделями, чтобы они не стирались
       - ./model_data:/app/models
     restart: unless-stopped
