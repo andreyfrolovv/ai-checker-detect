@@ -95,7 +95,7 @@ class ActivateRequest(BaseModel):
 class CheckTextRequest(BaseModel):
     text: str
     threshold: float = 0.5
-    max_len: int = 768
+    # max_len: int = 768
 
 
 # Фоновая задача для скачивания
